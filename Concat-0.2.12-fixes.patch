@@ -1,0 +1,832 @@
+diff --git a/FIXES-0.2.12.md b/FIXES-0.2.12.md
+new file mode 100644
+index 0000000..ef712b4
+--- /dev/null
++++ b/FIXES-0.2.12.md
+@@ -0,0 +1,26 @@
++# Concat 0.2.12 — Auto Captions fixes
++
++This source tree contains two targeted changes to the 0.2.12 source.
++
++## 1. Captions across split clips
++
++When the selected clip is one piece of a continuous split, Auto Captions now finds the complete adjacent source chain on that timeline track and sends the combined source range to Whisper. The chain must use the same media file, audio stream, and constant playback speed, with no gap or overlap in either timeline time or source time. Selecting either the head or tail finds the same chain. Unrelated uses of the same file are left alone. Clips with speed curves retain the previous single-clip behavior.
++
++## 2. Word range for generated speech captions
++
++The speech-captions form now has **Minimum words** and **Maximum words** controls (1–12). The defaults are 2 and 4, and the chosen values are saved in application preferences. Old settings files remain compatible and use those defaults.
++
++Whisper returns phrase-level timestamps, not word-level timestamps. When a phrase is split, its time is therefore apportioned between the resulting captions by the character count of each word group. Short neighboring phrases are merged when their gap is at most 0.6 seconds and the merged caption remains within the selected maximum. A very short isolated phrase may still fall below the minimum rather than joining across a long pause; the maximum is respected.
++
++## Tests and validation
++
++New Rust unit tests cover word grouping, merging nearby short phrases, preference serialization/backward compatibility, and finding split chains from either side while excluding speed/audio-stream mismatches.
++
++In the preparation environment, all locale JSON files parsed; the locale inventory reported no stale keys (new labels are translated in Arabic and fall back to English in other locales); the Slint-to-Rust callback paths were checked; and a word-partition model was exercised for ranges 1–12. A Rust toolchain (`rustc`, `cargo`, and `rustfmt`) was not available, so the Rust tests, Slint compilation, formatting check, and Windows executable build have **not** been run here.
++
++To build and test on a configured development machine, use the repository's documented toolchain (Rust 1.93 and native dependencies), then from `src/` run:
++
++```sh
++cargo test
++cargo build --profile app -p concat
++```
+diff --git a/src/crates/concat/locales/ar.json b/src/crates/concat/locales/ar.json
+index ea89193..477bf69 100644
+--- a/src/crates/concat/locales/ar.json
++++ b/src/crates/concat/locales/ar.json
+@@ -34,13 +34,15 @@
+   "captions.importSrt": "استيراد SRT…",
+   "captions.language": "اللغة",
+   "captions.loadingTheModel": "جارٍ تحميل النموذج",
++  "captions.maximumWords": "الحد الأقصى لعدد الكلمات",
++  "captions.minimumWords": "الحد الأدنى لعدد الكلمات",
+   "captions.noCaptionsToExport": "لا توجد تسميات توضيحية على المخطط الزمني لتصديرها",
+   "captions.noStylesMatch": "لا توجد أنماط مطابقة",
+   "captions.noSubtitlesInFile": "لا يحتوي الملف على ترجمات",
+   "captions.noVoiceOnTimeline": "لا يوجد مقطع بصوت في المخطط الزمني",
+   "captions.nothingSaidClip": "لم يُقَل شيء في ذلك المقطع",
+   "captions.nothingToCaptionYet": "لا يوجد ما يُضاف له تسميات توضيحية بعد",
+-  "captions.oneTitlePerPhrase": "عنوان لكل عبارة منطوقة، مقصوص على توقيت الكلمات نفسها، على أول مسار فيه متّسع.",
++  "captions.oneTitlePerPhrase": "تُقسَّم العبارات المنطوقة إلى تسميات توضيحية وفق نطاق الكلمات أعلاه؛ ويُقدَّر توقيت كل جزء داخل العبارة.",
+   "captions.oneTitlePerSentence": "عنوان لكل جملة، يبقى طوال المدة اللازمة لقراءته، واحدًا تلو الآخر على أول مسار فيه متّسع.",
+   "captions.placement": "الموضع",
+   "captions.readingTheSound": "جارٍ قراءة صوت المقطع",
+diff --git a/src/crates/concat/locales/en.json b/src/crates/concat/locales/en.json
+index 2a791f3..c78c725 100644
+--- a/src/crates/concat/locales/en.json
++++ b/src/crates/concat/locales/en.json
+@@ -33,6 +33,8 @@
+   "captions.generateCaptions": "Generate captions",
+   "captions.importSrt": "Import SRT…",
+   "captions.language": "Language",
++  "captions.minimumWords": "Minimum words",
++  "captions.maximumWords": "Maximum words",
+   "captions.loadingTheModel": "Loading the model",
+   "captions.noCaptionsToExport": "No captions on the timeline to export",
+   "captions.noStylesMatch": "No styles match",
+@@ -40,7 +42,7 @@
+   "captions.noVoiceOnTimeline": "No clip on the timeline has sound",
+   "captions.nothingSaidClip": "Nothing was said in that clip",
+   "captions.nothingToCaptionYet": "Nothing to caption yet",
+-  "captions.oneTitlePerPhrase": "One title per phrase spoken, cut to the words' own timing, on the first lane with room.",
++  "captions.oneTitlePerPhrase": "Spoken phrases are divided into captions using the word range above; timing is estimated within each phrase.",
+   "captions.oneTitlePerSentence": "One title per sentence, held for as long as it takes to read, one after another on the first lane with room.",
+   "captions.placement": "Placement",
+   "captions.readingTheSound": "Reading the clip's sound",
+diff --git a/src/crates/concat/src/lib.rs b/src/crates/concat/src/lib.rs
+index a5c806b..c0c777e 100644
+--- a/src/crates/concat/src/lib.rs
++++ b/src/crates/concat/src/lib.rs
+@@ -2516,6 +2516,12 @@ fn start(project: Option<std::path::PathBuf>, smoke: Smoke) -> Result<(), slint:
+     app.on_captions_size_changed(on_window!(|state, index: i32| {
+         state.handle(Msg::Captions(CaptionsMsg::SizeChanged(index)));
+     }));
++    app.on_captions_minimum_words_changed(on_window!(|state, index: i32| {
++        state.handle(Msg::Captions(CaptionsMsg::MinimumWordsChanged(index)));
++    }));
++    app.on_captions_maximum_words_changed(on_window!(|state, index: i32| {
++        state.handle(Msg::Captions(CaptionsMsg::MaximumWordsChanged(index)));
++    }));
+     app.on_captions_begin(on_window!(|state| {
+         state.handle(Msg::Captions(CaptionsMsg::Begin));
+     }));
+@@ -2553,6 +2559,12 @@ fn start(project: Option<std::path::PathBuf>, smoke: Smoke) -> Result<(), slint:
+     editor.on_captions_size_changed(on_window!(|state, index: i32| {
+         state.handle(Msg::Captions(CaptionsMsg::SizeChanged(index)));
+     }));
++    editor.on_captions_minimum_words_changed(on_window!(|state, index: i32| {
++        state.handle(Msg::Captions(CaptionsMsg::MinimumWordsChanged(index)));
++    }));
++    editor.on_captions_maximum_words_changed(on_window!(|state, index: i32| {
++        state.handle(Msg::Captions(CaptionsMsg::MaximumWordsChanged(index)));
++    }));
+     editor.on_captions_begin(on_window!(|state| {
+         state.handle(Msg::Captions(CaptionsMsg::Begin));
+     }));
+diff --git a/src/crates/concat/src/panes/captions.rs b/src/crates/concat/src/panes/captions.rs
+index a078ec2..de68555 100644
+--- a/src/crates/concat/src/panes/captions.rs
++++ b/src/crates/concat/src/panes/captions.rs
+@@ -64,6 +64,8 @@ pub enum CaptionsMsg {
+     /// Row in the language list: 0 is "Auto-detect", then
+     /// [`concat_speech::transcribe::LANGUAGES`] in its order.
+     LanguageChanged(i32),
++    MinimumWordsChanged(i32),
++    MaximumWordsChanged(i32),
+     PlacementChanged(i32),
+     SizeChanged(i32),
+     /// Run the pass the sheet describes.
+@@ -112,8 +114,9 @@ pub struct CaptionsPane {
+     /// "Use Sample Voice": the words come from [`Self::clip`]'s sound
+     /// when on, from [`Self::text`] when off.
+     pub from_voice: bool,
+-    /// The clip whose voice is transcribed: one with sound, chosen from the
+-    /// timeline's. Kept while the switch is off, so turning it back on
++    /// The chosen source clip: one with sound, picked from the timeline.
++    /// A constant-speed chain of adjacent split pieces is transcribed as
++    /// one source run. Kept while the switch is off, so turning it back on
+     /// returns to the same clip. The panel floats over a live editor, so
+     /// a clip with sound selected since is the one shown and run instead;
+     /// see [`Self::subject_clip`].
+@@ -134,6 +137,9 @@ pub struct CaptionsPane {
+     pub placement: usize,
+     /// 0 small, 1 medium, 2 large.
+     pub size: usize,
++    /// Preferred lower and upper word counts in a generated speech caption.
++    pub min_words: usize,
++    pub max_words: usize,
+     pub running: bool,
+     /// How far the running transcription looks.
+     pub pace: Pace,
+@@ -215,6 +221,15 @@ impl CaptionsPane {
+                 studio.prefs.caption_language = self.language.clone();
+                 studio.prefs.save(&studio.host.dirs);
+             }
++            CaptionsMsg::MinimumWordsChanged(index) => {
++                self.min_words = word_count_at(index);
++                self.max_words = self.max_words.max(self.min_words).min(MAX_CAPTION_WORDS);
++                self.save_word_range(studio);
++            }
++            CaptionsMsg::MaximumWordsChanged(index) => {
++                self.max_words = word_count_at(index).max(self.min_words);
++                self.save_word_range(studio);
++            }
+             CaptionsMsg::PlacementChanged(index) => {
+                 self.placement = (index.max(0) as usize).min(2);
+             }
+@@ -246,6 +261,11 @@ impl CaptionsPane {
+                         };
+                         let look = subject.look;
+                         let (base, font) = caption_base(studio);
++                        let segments = word_range_segments(
++                            segments,
++                            self.min_words.max(1),
++                            self.max_words.max(self.min_words).min(MAX_CAPTION_WORDS),
++                        );
+                         let commands: Vec<Command> = segments
+                             .into_iter()
+                             .filter_map(|segment| {
+@@ -505,6 +525,23 @@ impl CaptionsPane {
+                 .filter(|code| language_row(Some(code)) > 0),
+             placement: 0,
+             size: 1,
++            min_words: studio
++                .prefs
++                .caption_min_words
++                .unwrap_or(2)
++                .clamp(1, MAX_CAPTION_WORDS as u8) as usize,
++            max_words: (studio
++                .prefs
++                .caption_max_words
++                .unwrap_or(4)
++                .clamp(1, MAX_CAPTION_WORDS as u8) as usize)
++                .max(
++                    studio
++                        .prefs
++                        .caption_min_words
++                        .unwrap_or(2)
++                        .clamp(1, MAX_CAPTION_WORDS as u8) as usize,
++                ),
+             timings: std::mem::take(&mut self.timings),
+             shown: self.shown,
+             ..CaptionsPane::default()
+@@ -534,6 +571,17 @@ impl CaptionsPane {
+         )
+     }
+ 
++    /// Saves the speech-caption word range as one preference change.
++    fn save_word_range(&self, studio: &mut Studio) {
++        studio.prefs.caption_min_words = Some(self.min_words.clamp(1, MAX_CAPTION_WORDS) as u8);
++        studio.prefs.caption_max_words = Some(
++            self.max_words
++                .max(self.min_words)
++                .clamp(1, MAX_CAPTION_WORDS) as u8,
++        );
++        studio.prefs.save(&studio.host.dirs);
++    }
++
+     /// The script as titles, one after another from the playhead.
+     fn run_script(&mut self, studio: &mut Studio) {
+         let lines = script_captions(&self.text);
+@@ -577,6 +625,27 @@ impl CaptionsPane {
+             self.message = t("captions.clipNoLongerTimeline");
+             return;
+         };
++        // Splitting a clip leaves its head and tail as separate timeline
++        // clips. When one of those pieces is captioned, transcribe the whole
++        // uninterrupted source chain so captions continue across every cut.
++        // Variable-speed clips stay on the single-clip path: their changing
++        // timeline-to-source map cannot be represented by one constant rate.
++        let chain = caption_source_chain(
++            studio.timeline().clips.iter().map(|piece| piece.as_ref()),
++            &clip,
++        );
++        let source_window: f64 = chain
++            .iter()
++            .map(|piece| piece.duration * piece.speed)
++            .sum();
++        let use_chain = chain.len() > 1 && source_window.is_finite() && source_window > 0.0;
++        let (caption_start, caption_source_start, total_window) = if use_chain {
++            let first = chain[0];
++            (first.start, first.source_start, source_window)
++        } else {
++            (clip.start, clip.source_start, clip.duration * clip.speed)
++        };
++        let caption_speed = clip.speed;
+         let Some(media) = studio.project().media_by_id(&clip.media_id).cloned() else {
+             self.message = t("captions.clipHasNoFile");
+             return;
+@@ -591,8 +660,8 @@ impl CaptionsPane {
+         let request = concat_speech::transcribe::TranscribeRequest {
+             path: media.path.clone(),
+             audio_stream: clip.audio_stream,
+-            source_start: clip.source_start,
+-            window: clip.duration * clip.speed,
++            source_start: caption_source_start,
++            window: total_window,
+             model_id: model.clone(),
+             language: (!concat_speech::transcribe::english_only(&model))
+                 .then(|| self.language.clone())
+@@ -621,8 +690,8 @@ impl CaptionsPane {
+             (Stage::Working, windows * per_window),
+         ]);
+         self.subject = Some(Subject {
+-            start: clip.start,
+-            speed: clip.speed,
++            start: caption_start,
++            speed: caption_speed,
+             look: self.look(),
+             model,
+             windows,
+@@ -700,6 +769,8 @@ impl CaptionsPane {
+             language_fixed: english_only,
+             placement: self.placement as i32,
+             size: self.size as i32,
++            min_words: self.min_words.max(1).min(MAX_CAPTION_WORDS) as i32,
++            max_words: self.max_words.max(self.min_words.max(1)).min(MAX_CAPTION_WORDS) as i32,
+             running: self.running,
+             progress: self.pace.floor,
+             ceiling: self.pace.ceiling,
+@@ -717,6 +788,166 @@ impl CaptionsPane {
+     }
+ }
+ 
++/// Maximum word count exposed by the captions sheet.
++const MAX_CAPTION_WORDS: usize = 12;
++
++/// Maps a Select row (zero based) to the one-based word count.
++fn word_count_at(index: i32) -> usize {
++    usize::try_from(index)
++        .unwrap_or(0)
++        .saturating_add(1)
++        .clamp(1, MAX_CAPTION_WORDS)
++}
++
++/// The same source clip before a split, after a split, or another piece of
++/// that same continuous edit. Speed curves are excluded because a single
++/// constant-speed transcription request cannot describe their timing.
++fn same_caption_source(
++    left: &concat_project::model::Clip,
++    right: &concat_project::model::Clip,
++) -> bool {
++    left.track_id == right.track_id
++        && left.media_id == right.media_id
++        && left.audio_stream == right.audio_stream
++        && left.speed_curve.is_none()
++        && right.speed_curve.is_none()
++        && (left.speed - right.speed).abs() <= 1e-9
++}
++
++/// Whether two pieces still touch in both timeline time and source time.
++fn caption_pieces_touch(
++    left: &concat_project::model::Clip,
++    right: &concat_project::model::Clip,
++) -> bool {
++    const EPSILON: f64 = 1e-6;
++    (left.start + left.duration - right.start).abs() <= EPSILON
++        && (left.source_start + left.duration * left.speed - right.source_start).abs() <= EPSILON
++}
++
++/// Finds the complete contiguous split chain containing `selected`, in
++/// timeline order. Unrelated uses of the same file are not pulled in.
++fn caption_source_chain<'a>(
++    clips: impl IntoIterator<Item = &'a concat_project::model::Clip>,
++    selected: &concat_project::model::Clip,
++) -> Vec<&'a concat_project::model::Clip> {
++    let mut candidates: Vec<_> = clips
++        .into_iter()
++        .filter(|clip| same_caption_source(clip, selected))
++        .collect();
++    candidates.sort_by(|left, right| left.start.total_cmp(&right.start));
++    let Some(selected_at) = candidates.iter().position(|clip| clip.id == selected.id) else {
++        return Vec::new();
++    };
++    let mut first = selected_at;
++    while first > 0 && caption_pieces_touch(candidates[first - 1], candidates[first]) {
++        first -= 1;
++    }
++    let mut last = selected_at;
++    while last + 1 < candidates.len()
++        && caption_pieces_touch(candidates[last], candidates[last + 1])
++    {
++        last += 1;
++    }
++    candidates[first..=last].to_vec()
++}
++
++/// Splits each Whisper phrase into captions whose word counts fit the
++/// chosen range whenever that is mathematically possible. Whisper supplies
++/// phrase timestamps, not word timestamps, so a phrase's time is divided
++/// among its groups in proportion to each group's character count.
++fn word_range_segments(
++    segments: Vec<Segment>,
++    min_words: usize,
++    max_words: usize,
++) -> Vec<Segment> {
++    const MAX_MERGE_GAP: f64 = 0.6;
++
++    let min_words = min_words.clamp(1, MAX_CAPTION_WORDS);
++    let max_words = max_words.max(min_words).min(MAX_CAPTION_WORDS);
++    let split: Vec<Segment> = segments
++        .into_iter()
++        .flat_map(|segment| split_segment_words(segment, min_words, max_words))
++        .collect();
++    let mut output: Vec<Segment> = Vec::with_capacity(split.len());
++    let mut index = 0;
++
++    while index < split.len() {
++        let mut current = split[index].clone();
++        let current_words = current.text.split_whitespace().count();
++
++        // Whisper may end a phrase with only one or two words. Join that
++        // phrase to a nearby one when the pause is short and the result
++        // still fits the selected maximum. Never bridge a longer pause.
++        if current_words < min_words {
++            if let Some(next) = split.get(index + 1).filter(|next| {
++                next.start - current.end <= MAX_MERGE_GAP
++                    && current_words + next.text.split_whitespace().count() <= max_words
++            }) {
++                current.end = next.end;
++                current.text = format!("{} {}", current.text.trim(), next.text.trim());
++                index += 1;
++            } else if let Some(previous) = output.last_mut().filter(|previous| {
++                current.start - previous.end <= MAX_MERGE_GAP
++                    && previous.text.split_whitespace().count() + current_words <= max_words
++            }) {
++                previous.end = current.end;
++                previous.text = format!("{} {}", previous.text.trim(), current.text.trim());
++                index += 1;
++                continue;
++            }
++        }
++
++        output.push(current);
++        index += 1;
++    }
++    output
++}
++
++fn split_segment_words(segment: Segment, min_words: usize, max_words: usize) -> Vec<Segment> {
++    let words: Vec<&str> = segment.text.split_whitespace().collect();
++    if words.is_empty() || words.len() <= max_words {
++        return vec![segment];
++    }
++
++    let fewest_groups = words.len().div_ceil(max_words);
++    let most_groups = (words.len() / min_words).max(1);
++    let average = (min_words + max_words) as f64 / 2.0;
++    let target_groups = (words.len() as f64 / average).round() as usize;
++    let groups = target_groups.clamp(fewest_groups, most_groups.max(fewest_groups));
++    let base = words.len() / groups;
++    let extra = words.len() % groups;
++    let weights: Vec<usize> = words
++        .iter()
++        .map(|word| word.chars().count().max(1))
++        .collect();
++    let total_weight: usize = weights.iter().sum();
++    let duration = segment.end - segment.start;
++    let mut word_at = 0usize;
++    let mut consumed_weight = 0usize;
++    let mut output = Vec::with_capacity(groups);
++
++    for group_at in 0..groups {
++        let count = base + usize::from(group_at < extra);
++        let end_word = word_at + count;
++        let text = words[word_at..end_word].join(" ");
++        let group_weight: usize = weights[word_at..end_word].iter().sum();
++        let start = if group_at == 0 {
++            segment.start
++        } else {
++            segment.start + duration * consumed_weight as f64 / total_weight as f64
++        };
++        consumed_weight += group_weight;
++        let end = if group_at + 1 == groups {
++            segment.end
++        } else {
++            segment.start + duration * consumed_weight as f64 / total_weight as f64
++        };
++        output.push(Segment { start, end, text });
++        word_at = end_word;
++    }
++    output
++}
++
+ /// English, as the language list names it.
+ const ENGLISH: &str = "English";
+ 
+@@ -1059,7 +1290,12 @@ fn wrap_caption(sentence: &str) -> Vec<String> {
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::{script_captions, source_label};
++    use super::{
++        caption_pieces_touch, caption_source_chain, script_captions, source_label,
++        split_segment_words, word_range_segments,
++    };
++    use concat_project::model::Clip;
++    use concat_speech::transcribe::Segment;
+ 
+     #[test]
+     fn imported_srt_preserves_short_cues_and_multiline_text() {
+@@ -1188,4 +1424,187 @@ mod tests {
+         assert!(script_captions("  \n ").is_empty());
+         assert_eq!(script_captions("你好。再见！").len(), 2);
+     }
++
++    #[test]
++    fn speech_captions_obey_the_selected_word_range() {
++        let split = split_segment_words(
++            Segment {
++                start: 1.0,
++                end: 7.0,
++                text: "One two three four five six seven eight nine".into(),
++            },
++            2,
++            4,
++        );
++        let counts: Vec<usize> = split
++            .iter()
++            .map(|segment| segment.text.split_whitespace().count())
++            .collect();
++        assert_eq!(counts, vec![3, 3, 3]);
++        assert_eq!(split.first().unwrap().start, 1.0);
++        assert_eq!(split.last().unwrap().end, 7.0);
++        assert!(split
++            .windows(2)
++            .all(|pair| (pair[0].end - pair[1].start).abs() < 1e-9));
++    }
++
++    #[test]
++    fn word_range_keeps_short_whisper_phrases_and_splits_long_ones() {
++        let result = word_range_segments(
++            vec![
++                Segment {
++                    start: 0.0,
++                    end: 1.0,
++                    text: "Hello there".into(),
++                },
++                Segment {
++                    start: 1.2,
++                    end: 5.2,
++                    text: "one two three four five six seven eight".into(),
++                },
++            ],
++            2,
++            4,
++        );
++        assert_eq!(result.len(), 4);
++        assert_eq!(result[0].text, "Hello there");
++        assert_eq!(result[1].text.split_whitespace().count(), 3);
++        assert_eq!(result[2].text.split_whitespace().count(), 3);
++        assert_eq!(result[3].text.split_whitespace().count(), 2);
++    }
++
++    #[test]
++    fn adjacent_short_whisper_phrases_merge_when_the_pause_and_word_range_allow_it() {
++        let result = word_range_segments(
++            vec![
++                Segment {
++                    start: 0.0,
++                    end: 0.4,
++                    text: "Hello".into(),
++                },
++                Segment {
++                    start: 0.5,
++                    end: 1.0,
++                    text: "there friend".into(),
++                },
++                Segment {
++                    start: 2.0,
++                    end: 2.2,
++                    text: "Stop".into(),
++                },
++            ],
++            2,
++            4,
++        );
++
++        assert_eq!(result.len(), 2);
++        assert_eq!(result[0].text, "Hello there friend");
++        assert_eq!(result[0].start, 0.0);
++        assert_eq!(result[0].end, 1.0);
++        // A phrase after a longer pause remains independent, even when
++        // it cannot reach the minimum without crossing that pause.
++        assert_eq!(result[1].text, "Stop");
++    }
++
++    #[test]
++    fn selecting_either_piece_of_a_split_clip_finds_its_full_contiguous_chain() {
++        let mut head = Clip::blank(
++            "head",
++            "track",
++            concat_project::model::ClipKind::Video,
++            "source",
++            0.0,
++            5.0,
++        );
++        head.media_id = "media".into();
++        head.source_start = 0.0;
++        let mut tail = Clip::blank(
++            "tail",
++            "track",
++            concat_project::model::ClipKind::Video,
++            "source",
++            5.0,
++            7.0,
++        );
++        tail.media_id = "media".into();
++        tail.source_start = 5.0;
++        let mut later = Clip::blank(
++            "later",
++            "track",
++            concat_project::model::ClipKind::Video,
++            "source",
++            20.0,
++            3.0,
++        );
++        later.media_id = "media".into();
++        later.source_start = 12.0;
++        let clips = vec![later.clone(), tail.clone(), head.clone()];
++
++        let chain = caption_source_chain(clips.iter(), &tail);
++        assert_eq!(
++            chain.iter().map(|clip| clip.id.as_str()).collect::<Vec<_>>(),
++            vec!["head", "tail"]
++        );
++        assert!(caption_pieces_touch(&head, &tail));
++        assert!(!caption_pieces_touch(&tail, &later));
++
++        let from_head = caption_source_chain(clips.iter(), &head);
++        assert_eq!(from_head.len(), 2);
++    }
++
++    #[test]
++    fn split_chain_does_not_join_different_playback_speeds() {
++        let mut head = Clip::blank(
++            "head",
++            "track",
++            concat_project::model::ClipKind::Video,
++            "source",
++            0.0,
++            5.0,
++        );
++        head.media_id = "media".into();
++        let mut tail = Clip::blank(
++            "tail",
++            "track",
++            concat_project::model::ClipKind::Video,
++            "source",
++            5.0,
++            5.0,
++        );
++        tail.media_id = "media".into();
++        tail.source_start = 5.0;
++        tail.speed = 2.0;
++        let clips = vec![head.clone(), tail.clone()];
++        let chain = caption_source_chain(clips.iter(), &head);
++        assert_eq!(chain.len(), 1);
++    }
++
++    #[test]
++    fn split_chain_does_not_join_different_audio_streams() {
++        let mut head = Clip::blank(
++            "head",
++            "track",
++            concat_project::model::ClipKind::Video,
++            "source",
++            0.0,
++            5.0,
++        );
++        head.media_id = "media".into();
++        head.audio_stream = Some(0);
++        let mut tail = Clip::blank(
++            "tail",
++            "track",
++            concat_project::model::ClipKind::Video,
++            "source",
++            5.0,
++            5.0,
++        );
++        tail.media_id = "media".into();
++        tail.source_start = 5.0;
++        tail.audio_stream = Some(1);
++
++        let chain = caption_source_chain(vec![&head, &tail], &head);
++        assert_eq!(chain.len(), 1);
++    }
++
+ }
+diff --git a/src/crates/concat/src/prefs.rs b/src/crates/concat/src/prefs.rs
+index fa99cf2..bc0445a 100644
+--- a/src/crates/concat/src/prefs.rs
++++ b/src/crates/concat/src/prefs.rs
+@@ -111,6 +111,11 @@ pub struct Preferences {
+     /// whisper's code ("id", "de", ...). `None` is whisper's to hear, and
+     /// so is a code whisper no longer knows.
+     pub caption_language: Option<String>,
++    /// Minimum words in a generated speech caption. Missing means two,
++    /// which keeps older settings files at the shipped default.
++    pub caption_min_words: Option<u8>,
++    /// Maximum words in a generated speech caption. Missing means four.
++    pub caption_max_words: Option<u8>,
+     /// The text preset captions are set in, by id; `None`, "default" and
+     /// an id no longer on the list are the plain look.
+     pub caption_style: Option<String>,
+@@ -1262,4 +1267,23 @@ mod tests {
+         assert_eq!(leftovers, 0);
+         let _ = std::fs::remove_dir_all(dirs.config.parent().expect("a root"));
+     }
++
++    #[test]
++    fn caption_word_range_preferences_round_trip_and_old_files_keep_defaults() {
++        let preferences = Preferences {
++            caption_min_words: Some(3),
++            caption_max_words: Some(5),
++            ..Preferences::default()
++        };
++        let json = serde_json::to_string(&preferences).expect("serializes");
++        let restored: Preferences = serde_json::from_str(&json).expect("reads");
++        assert_eq!(restored.caption_min_words, Some(3));
++        assert_eq!(restored.caption_max_words, Some(5));
++
++        let old: Preferences =
++            serde_json::from_str(r#"{"dark":false}"#).expect("old settings read");
++        assert_eq!(old.caption_min_words, None);
++        assert_eq!(old.caption_max_words, None);
++    }
++
+ }
+diff --git a/src/crates/concat/ui/app.slint b/src/crates/concat/ui/app.slint
+index 71ca850..ac836f6 100644
+--- a/src/crates/concat/ui/app.slint
++++ b/src/crates/concat/ui/app.slint
+@@ -460,6 +460,8 @@ export component App inherits Window {
+     callback captions-language-changed(index: int);
+     callback captions-placement-changed(index: int);
+     callback captions-size-changed(index: int);
++    callback captions-minimum-words-changed(index: int);
++    callback captions-maximum-words-changed(index: int);
+     callback captions-begin();
+     callback captions-cancel();
+     callback captions-import-srt();
+@@ -894,6 +896,8 @@ export component App inherits Window {
+             language-changed(index) => { root.captions-language-changed(index); }
+             placement-changed(index) => { root.captions-placement-changed(index); }
+             size-changed(index) => { root.captions-size-changed(index); }
++            minimum-words-changed(index) => { root.captions-minimum-words-changed(index); }
++            maximum-words-changed(index) => { root.captions-maximum-words-changed(index); }
+             begin => { root.captions-begin(); }
+             cancel => { root.captions-cancel(); }
+             import-srt => { root.captions-import-srt(); }
+diff --git a/src/crates/concat/ui/dialogs/captions.slint b/src/crates/concat/ui/dialogs/captions.slint
+index cd86462..ca04c10 100644
+--- a/src/crates/concat/ui/dialogs/captions.slint
++++ b/src/crates/concat/ui/dialogs/captions.slint
+@@ -66,6 +66,9 @@ export struct CaptionsSheetData {
+     placement: int,
+     /// 0 Small, 1 Medium, 2 Large
+     size: int,
++    /// Minimum and maximum words per generated speech caption.
++    min-words: int,
++    max-words: int,
+     running: bool,
+     /// 0..1: where the transcription surely is.
+     progress: float,
+@@ -102,6 +105,8 @@ export component CaptionsForm inherits VerticalLayout {
+     callback language-changed(index: int);
+     callback placement-changed(index: int);
+     callback size-changed(index: int);
++    callback minimum-words-changed(index: int);
++    callback maximum-words-changed(index: int);
+     callback begin();
+     callback cancel();
+     callback import-srt();
+@@ -239,6 +244,24 @@ export component CaptionsForm inherits VerticalLayout {
+                 }
+             }
+ 
++            if root.from-voice: DialogRow {
++                label: I18n.t("captions.minimumWords");
++                Select {
++                    options: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12"];
++                    current: root.data.min-words - 1;
++                    changed(index) => { root.minimum-words-changed(index); }
++                }
++            }
++
++            if root.from-voice: DialogRow {
++                label: I18n.t("captions.maximumWords");
++                Select {
++                    options: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12"];
++                    current: root.data.max-words - 1;
++                    changed(index) => { root.maximum-words-changed(index); }
++                }
++            }
++
+             DialogRow {
+                 label: I18n.t("captions.placement");
+                 SegmentedControl {
+@@ -406,6 +429,8 @@ export component CaptionsDialog inherits Modal {
+     callback language-changed(index: int);
+     callback placement-changed(index: int);
+     callback size-changed(index: int);
++    callback minimum-words-changed(index: int);
++    callback maximum-words-changed(index: int);
+     callback begin();
+     callback cancel();
+     callback import-srt();
+@@ -428,6 +453,8 @@ export component CaptionsDialog inherits Modal {
+         language-changed(index) => { root.language-changed(index); }
+         placement-changed(index) => { root.placement-changed(index); }
+         size-changed(index) => { root.size-changed(index); }
++        minimum-words-changed(index) => { root.minimum-words-changed(index); }
++        maximum-words-changed(index) => { root.maximum-words-changed(index); }
+         begin => { root.begin(); }
+         cancel => { root.cancel(); }
+         import-srt => { root.import-srt(); }
+diff --git a/src/crates/concat/ui/editor.slint b/src/crates/concat/ui/editor.slint
+index fa463d7..7d5b9ae 100644
+--- a/src/crates/concat/ui/editor.slint
++++ b/src/crates/concat/ui/editor.slint
+@@ -463,6 +463,8 @@ export global Editor {
+     callback captions-language-changed(index: int);
+     callback captions-placement-changed(index: int);
+     callback captions-size-changed(index: int);
++    callback captions-minimum-words-changed(index: int);
++    callback captions-maximum-words-changed(index: int);
+     callback captions-begin();
+     callback captions-cancel();
+     callback captions-import-srt();
+diff --git a/src/crates/concat/ui/primitives/modal.slint b/src/crates/concat/ui/primitives/modal.slint
+index 120f061..d3176af 100644
+--- a/src/crates/concat/ui/primitives/modal.slint
++++ b/src/crates/concat/ui/primitives/modal.slint
+@@ -245,11 +245,11 @@ export component Modal inherits Rectangle {
+                 min-height: 0px;
+                 vertical-stretch: 1;
+                 interactive: content.preferred-height > self.height;
+-                viewport-height: Math.max(self.height, content.preferred-height);
++                content-height: Math.max(self.height, content.preferred-height);
+ 
+                 content := VerticalLayout {
+                     width: scroller.width;
+-                    height: scroller.viewport-height;
++                    height: scroller.content-height;
+ 
+                     @children
+                 }
+diff --git a/src/crates/concat/ui/workspace/media-pane.slint b/src/crates/concat/ui/workspace/media-pane.slint
+index 08ec201..908f114 100644
+--- a/src/crates/concat/ui/workspace/media-pane.slint
++++ b/src/crates/concat/ui/workspace/media-pane.slint
+@@ -1767,6 +1767,8 @@ export component MediaPane inherits Rectangle {
+     callback captions-language-changed(index: int);
+     callback captions-placement-changed(index: int);
+     callback captions-size-changed(index: int);
++    callback captions-minimum-words-changed(index: int);
++    callback captions-maximum-words-changed(index: int);
+     callback captions-begin();
+     callback captions-cancel();
+     callback captions-import-srt();
+@@ -2667,6 +2669,8 @@ export component MediaPane inherits Rectangle {
+                         language-changed(index) => { root.captions-language-changed(index); }
+                         placement-changed(index) => { root.captions-placement-changed(index); }
+                         size-changed(index) => { root.captions-size-changed(index); }
++                        minimum-words-changed(index) => { root.captions-minimum-words-changed(index); }
++                        maximum-words-changed(index) => { root.captions-maximum-words-changed(index); }
+                         begin => { root.captions-begin(); }
+                         cancel => { root.captions-cancel(); }
+                         import-srt => { root.captions-import-srt(); }
+diff --git a/src/crates/concat/ui/workspace/seat.slint b/src/crates/concat/ui/workspace/seat.slint
+index f9b00ef..c6733ac 100644
+--- a/src/crates/concat/ui/workspace/seat.slint
++++ b/src/crates/concat/ui/workspace/seat.slint
+@@ -116,6 +116,8 @@ export component Seat inherits Rectangle {
+             captions-language-changed(index) => { Editor.captions-language-changed(index); }
+             captions-placement-changed(index) => { Editor.captions-placement-changed(index); }
+             captions-size-changed(index) => { Editor.captions-size-changed(index); }
++            captions-minimum-words-changed(index) => { Editor.captions-minimum-words-changed(index); }
++            captions-maximum-words-changed(index) => { Editor.captions-maximum-words-changed(index); }
+             captions-begin => { Editor.captions-begin(); }
+             captions-cancel => { Editor.captions-cancel(); }
+             captions-import-srt => { Editor.captions-import-srt(); }

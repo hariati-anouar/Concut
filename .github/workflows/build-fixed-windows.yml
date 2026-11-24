@@ -1,0 +1,204 @@
+name: Build patched Concat Windows Setup
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    name: Windows x86_64 installer
+    runs-on: windows-2022
+    timeout-minutes: 180
+    env:
+      CARGO_TERM_COLOR: always
+      ORT_VERSION: "1.28.0"
+      GGML_BACKEND_DL: "ON"
+      GGML_CPU_ALL_VARIANTS: "ON"
+      GGML_AVX2: "OFF"
+      GGML_FMA: "OFF"
+      GGML_F16C: "OFF"
+      GGML_BMI2: "OFF"
+
+    steps:
+      - name: Check out the fork
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Apply the Auto Captions fixes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not (Test-Path "Concat-0.2.12-fixes.patch")) {
+            throw "Concat-0.2.12-fixes.patch is missing from the repository root. Upload it there first."
+          }
+          git apply --check Concat-0.2.12-fixes.patch
+          if ($LASTEXITCODE -ne 0) { throw "The patch does not match this source tree. No files were changed." }
+          git apply Concat-0.2.12-fixes.patch
+          if ($LASTEXITCODE -ne 0) { throw "Applying the patch failed." }
+          Write-Host "Patch applied."
+
+      - name: Read the source version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $cargo = Get-Content "src/Cargo.toml" -Raw
+          $match = [regex]::Match($cargo, '(?m)^version\s*=\s*"([^\"]+)"')
+          if (-not $match.Success) { throw "Could not read the application version from src/Cargo.toml" }
+          $version = $match.Groups[1].Value
+          if ($version -ne "0.2.12") { throw "Expected source version 0.2.12, found $version. Stop rather than build the wrong version." }
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Building fixed Concat $version for Windows x86_64."
+
+      - name: Install the pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # 2026-10-09
+        with:
+          toolchain: "1.93.1"
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install FFmpeg development files and LLVM
+        shell: pwsh
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bash = "$env:ProgramFiles\Git\bin\bash.exe"
+          if (-not (Test-Path $bash)) { throw "Git Bash is missing on the Windows runner." }
+
+          & $bash scripts/ci/fetch.sh llvm-win64 llvm.exe
+          if ($LASTEXITCODE -ne 0) { throw "The pinned LLVM download failed." }
+          Start-Process -Wait -FilePath .\llvm.exe -ArgumentList "/S", "/D=C:\llvm"
+          if (-not (Test-Path C:\llvm\bin\libclang.dll)) { throw "LLVM did not install to C:\llvm." }
+          Remove-Item .\llvm.exe -ErrorAction SilentlyContinue
+          "C:\llvm\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "LIBCLANG_PATH=C:\llvm\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          & $bash scripts/ci/fetch.sh ffmpeg-win64 ffmpeg-win.zip
+          if ($LASTEXITCODE -ne 0) { throw "The pinned FFmpeg download failed." }
+          Expand-Archive -Path .\ffmpeg-win.zip -DestinationPath .\ffmpeg-unpacked -Force
+          $ffmpeg = Get-ChildItem .\ffmpeg-unpacked -Directory | Select-Object -First 1
+          if (-not $ffmpeg) { throw "The FFmpeg archive did not contain its expected folder." }
+          if (-not (Test-Path (Join-Path $ffmpeg.FullName "include"))) { throw "FFmpeg headers are missing." }
+          "FFMPEG_DIR=$($ffmpeg.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          (Join-Path $ffmpeg.FullName "bin") | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Install ONNX Runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bash = "$env:ProgramFiles\Git\bin\bash.exe"
+          & $bash scripts/ci/onnxruntime.sh win-x64
+          if ($LASTEXITCODE -ne 0) { throw "The pinned ONNX Runtime download or extraction failed." }
+          $ort = Join-Path $PWD "onnxruntime-win-x64-$env:ORT_VERSION"
+          if (-not (Test-Path (Join-Path $ort "lib\onnxruntime.lib"))) { throw "ONNX Runtime import library is missing." }
+          if (-not (Test-Path (Join-Path $ort "lib\onnxruntime.dll"))) { throw "ONNX Runtime DLL is missing." }
+          "ORT_DIR=$ort" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ORT_LIB_LOCATION=$(Join-Path $ort 'lib')" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ORT_PREFER_DYNAMIC_LINK=1" | Out-File -FilePath $env:GITHUB_ENV -Append
+          (Join-Path $ort "lib") | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: src
+          key: x86_64-pc-windows-msvc
+          env-vars: CARGO CC CFLAGS CXX CMAKE RUST GGML ORT
+
+      - name: Build Concat
+        shell: pwsh
+        timeout-minutes: 75
+        run: |
+          $ErrorActionPreference = "Stop"
+          Push-Location src
+          try {
+            cargo build --profile app -p concat --target x86_64-pc-windows-msvc
+            if ($LASTEXITCODE -ne 0) { throw "Cargo build failed with exit code $LASTEXITCODE." }
+          }
+          finally { Pop-Location }
+
+      - name: Stage the self-contained Windows app
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $name = "Concat-$env:VERSION-windows-x86_64"
+          $dir = Join-Path "stage" $name
+          New-Item -ItemType Directory -Force $dir | Out-Null
+
+          $exe = "src\target\x86_64-pc-windows-msvc\app\concat.exe"
+          if (-not (Test-Path $exe)) { throw "The built concat.exe was not found at $exe." }
+          Copy-Item $exe $dir
+          Copy-Item "$env:FFMPEG_DIR\bin\*.dll" $dir
+          Copy-Item "$env:ORT_DIR\lib\*.dll" $dir
+
+          $built = Get-ChildItem "src\target\x86_64-pc-windows-msvc\app\build\whisper-rs-sys-*\out\bin\ggml-cpu-x64.dll" |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $built) { throw "whisper-rs-sys did not produce ggml-cpu-x64.dll." }
+          Copy-Item (Join-Path $built.DirectoryName "whisper.dll") $dir
+          Copy-Item (Join-Path $built.DirectoryName "ggml*.dll") $dir
+          foreach ($module in "x64", "sandybridge", "haswell") {
+            if (-not (Test-Path (Join-Path $dir "ggml-cpu-$module.dll"))) {
+              throw "The required ggml-cpu-$module.dll module is missing."
+            }
+          }
+          Copy-Item LICENSE, THIRD_PARTY_NOTICES.md $dir
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "Visual Studio's vswhere.exe was not found." }
+          $vs = & $vswhere -latest -products * -property installationPath
+          $crt = Get-ChildItem "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC14*.CRT" -Directory |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $crt) { throw "The Visual C++ runtime redistributable folder was not found." }
+          $dumpbin = & $vswhere -latest -products * -find "VC\Tools\MSVC\**\bin\Host*\*\dumpbin.exe" | Select-Object -First 1
+          if (-not $dumpbin) { throw "dumpbin.exe was not found in Visual Studio Build Tools." }
+
+          # Include the Visual C++ runtime DLLs imported by the app and its DLLs.
+          foreach ($pass in 1, 2) {
+            $peFiles = Get-ChildItem $dir -Recurse -File | Where-Object { $_.Extension -in ".exe", ".dll" }
+            foreach ($pe in $peFiles) {
+              $lines = & $dumpbin /nologo /dependents $pe.FullName
+              if ($LASTEXITCODE -ne 0) { throw "dumpbin failed for $($pe.Name)." }
+              foreach ($line in $lines) {
+                $dll = $line.Trim()
+                if ($dll -match '^[A-Za-z0-9_.-]+\.dll$' -and
+                    (Test-Path (Join-Path $crt.FullName $dll)) -and
+                    -not (Test-Path (Join-Path $dir $dll))) {
+                  Copy-Item (Join-Path $crt.FullName $dll) $dir
+                }
+              }
+            }
+          }
+          Get-ChildItem $dir | Format-Table Name, Length
+
+      - name: Smoke test the staged app
+        shell: pwsh
+        timeout-minutes: 20
+        run: |
+          $ErrorActionPreference = "Stop"
+          $name = "Concat-$env:VERSION-windows-x86_64"
+          scripts/ci/smoke-windows.ps1 -Bundle "stage\$name"
+
+      - name: Build the Setup.exe installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "Inno Setup installation failed." }
+          }
+          if (-not (Test-Path $iscc)) { throw "Inno Setup's ISCC.exe is missing." }
+
+          $name = "Concat-$env:VERSION-windows-x86_64"
+          & $iscc "/DVersion=$env:VERSION" "/DArch=x64compatible" "/DSuffix=x86_64" `
+            "/DStage=$PWD\stage\$name" "/DOut=$PWD\stage" assets\windows\concat.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE." }
+          $installer = "stage\$name-setup.exe"
+          if (-not (Test-Path $installer)) { throw "The expected Setup.exe was not created." }
+          Write-Host "Created $installer"
+
+      - name: Upload the Windows installer
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Concat-0.2.12-Windows-Setup-Fixed
+          path: stage/Concat-0.2.12-windows-x86_64-setup.exe
+          if-no-files-found: error
+          retention-days: 30
