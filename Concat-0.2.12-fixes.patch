@@ -1,12 +1,12 @@
 diff --git a/FIXES-0.2.12.md b/FIXES-0.2.12.md
 new file mode 100644
-index 0000000..ef712b4
+index 0000000..280d8e6
 --- /dev/null
 +++ b/FIXES-0.2.12.md
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,30 @@
 +# Concat 0.2.12 — Auto Captions fixes
 +
-+This source tree contains two targeted changes to the 0.2.12 source.
++This source tree contains three targeted changes to the 0.2.12 source.
 +
 +## 1. Captions across split clips
 +
@@ -18,9 +18,13 @@ index 0000000..ef712b4
 +
 +Whisper returns phrase-level timestamps, not word-level timestamps. When a phrase is split, its time is therefore apportioned between the resulting captions by the character count of each word group. Short neighboring phrases are merged when their gap is at most 0.6 seconds and the merged caption remains within the selected maximum. A very short isolated phrase may still fall below the minimum rather than joining across a long pause; the maximum is respected.
 +
++## 3. Long silence between speech captions
++
++When Whisper returns one caption spanning multiple speech regions that Silero VAD separated in the original audio, the caption is now split across those speech regions. Words are assigned to the separate regions in proportion to their detected speech duration. Each resulting caption is bounded by its own speech region, so a long interval between regions (for example, 20 seconds) is left without a subtitle. If VAD has no matching region or its result is not trusted, the previous Whisper timing fallback is retained.
++
 +## Tests and validation
 +
-+New Rust unit tests cover word grouping, merging nearby short phrases, preference serialization/backward compatibility, and finding split chains from either side while excluding speed/audio-stream mismatches.
++New Rust unit tests cover word grouping, merging nearby short phrases, preserving a 20-second silence between two speech regions, preference serialization/backward compatibility, and finding split chains from either side while excluding speed/audio-stream mismatches.
 +
 +In the preparation environment, all locale JSON files parsed; the locale inventory reported no stale keys (new labels are translated in Arabic and fall back to English in other locales); the Slint-to-Rust callback paths were checked; and a word-partition model was exercised for ranges 1–12. A Rust toolchain (`rustc`, `cargo`, and `rustfmt`) was not available, so the Rust tests, Slint compilation, formatting check, and Windows executable build have **not** been run here.
 +
@@ -30,8 +34,221 @@ index 0000000..ef712b4
 +cargo test
 +cargo build --profile app -p concat
 +```
+diff --git a/src/crates/concat-speech/src/transcribe.rs b/src/crates/concat-speech/src/transcribe.rs
+index af7fa70..f64bc24 100644
+--- a/src/crates/concat-speech/src/transcribe.rs
++++ b/src/crates/concat-speech/src/transcribe.rs
+@@ -596,23 +596,92 @@ impl<'a> SpeechReel<'a> {
+ /// The rate whisper hears at.
+ const SAMPLE_RATE: u32 = 16_000;
+ 
+-/// A caption's span drawn in to the speech it covers. Whisper starts a
+-/// caption where the one before it ended, so the silence between two lines
+-/// went to the second, which came up seconds before it was said (#438); the
+-/// voice detector knows where the words begin and end. A caption over no
+-/// detected speech - a whisper too quiet for the detector, say - keeps the
+-/// times whisper gave it.
+-fn on_speech(start: f64, end: f64, speech: &[(f64, f64)]) -> (f64, f64) {
+-    let mut covered = speech
++/// Times a Whisper line only over the speech it covers. Whisper may return
++/// one line whose source-time span crosses several pieces of the speech reel:
++/// the reel places those pieces side by side, but they may be many seconds
++/// apart in the original sound. Treating the first start and last end as one
++/// caption would put that whole silence under the subtitle. Instead, divide
++/// the line's words among the covered speech spans, in proportion to their
++/// duration, and return one caption per span. If VAD found no matching speech
++/// (or was not trusted), keep Whisper's original timing.
++fn on_speech(
++    start: f64,
++    end: f64,
++    text: String,
++    speech: &[(f64, f64)],
++) -> Vec<Segment> {
++    let covered: Vec<(f64, f64)> = speech
+         .iter()
+-        .filter(|(from, to)| *from < end && *to > start);
+-    let Some(&(first, mut last)) = covered.next() else {
+-        return (start, end);
+-    };
+-    if let Some(&(_, to)) = covered.next_back() {
+-        last = to;
++        .filter_map(|&(from, to)| {
++            let from = start.max(from);
++            let to = end.min(to);
++            (to > from).then_some((from, to))
++        })
++        .collect();
++
++    if covered.is_empty() {
++        return keep_segment(start, end, text).into_iter().collect();
++    }
++    if covered.len() == 1 {
++        let (from, to) = covered[0];
++        return keep_segment(from, to, text).into_iter().collect();
++    }
++
++    let words: Vec<&str> = text.split_whitespace().collect();
++    if words.is_empty() {
++        return Vec::new();
++    }
++
++    // There cannot be an empty caption. If Whisper supplied fewer words than
++    // speech spans, use the longest spans for those words and leave the other
++    // spans empty rather than joining across a silence.
++    let group_count = covered.len().min(words.len());
++    let mut active: Vec<(usize, f64, f64)> = covered
++        .into_iter()
++        .enumerate()
++        .map(|(index, (from, to))| (index, from, to))
++        .collect();
++    if active.len() > group_count {
++        active.sort_by(|left, right| {
++            (right.2 - right.1)
++                .total_cmp(&(left.2 - left.1))
++                .then_with(|| left.0.cmp(&right.0))
++        });
++        active.truncate(group_count);
++        active.sort_by_key(|span| span.0);
++    }
++
++    // Give every active speech span at least one word. Divide the remaining
++    // words by speech duration, using largest remainders so none are lost.
++    let mut counts = vec![1usize; group_count];
++    let total_duration: f64 = active.iter().map(|span| span.2 - span.1).sum();
++    let remaining = words.len() - group_count;
++    let mut apportioned = 0usize;
++    let mut fractions = Vec::with_capacity(group_count);
++    for (index, span) in active.iter().enumerate() {
++        let exact = remaining as f64 * (span.2 - span.1) / total_duration;
++        let whole = exact.floor() as usize;
++        counts[index] += whole;
++        apportioned += whole;
++        fractions.push((index, exact - whole as f64));
++    }
++    fractions.sort_by(|left, right| {
++        right.1.total_cmp(&left.1).then_with(|| left.0.cmp(&right.0))
++    });
++    for (index, _) in fractions.into_iter().take(remaining - apportioned) {
++        counts[index] += 1;
++    }
++
++    let mut word_at = 0usize;
++    let mut result = Vec::with_capacity(group_count);
++    for ((_, from, to), count) in active.into_iter().zip(counts) {
++        let text = words[word_at..word_at + count].join(" ");
++        word_at += count;
++        if let Some(segment) = keep_segment(from, to, text) {
++            result.push(segment);
++        }
+     }
+-    (start.max(first), end.min(last))
++    result
+ }
+ 
+ /// What whisper hears of `samples`, and the speech its captions are timed
+@@ -1283,23 +1352,25 @@ impl Transcriber {
+         }
+ 
+         let eot = context.token_eot();
+-        let lines = state.as_iter().filter_map(|segment| {
++        let lines = state.as_iter().flat_map(|segment| {
+             if recipe.prune && made_up(&segment, eot) {
+                 log::debug!(
+                     "transcribe: dropped as made up of silence: {:?}",
+                     segment.to_str_lossy().unwrap_or_default()
+                 );
+-                return None;
++                return Vec::new();
+             }
+             // Whisper's timestamps are centiseconds, in what it heard.
+             let start = reel.to_source(segment.start_timestamp() as f64 / 100.0);
+             let end = reel.to_source(segment.end_timestamp() as f64 / 100.0);
+-            let (start, end) = on_speech(start, end, &speech);
+-            let mut text = segment.to_str_lossy().ok()?.trim().to_owned();
++            let Ok(text) = segment.to_str_lossy() else {
++                return Vec::new();
++            };
++            let mut text = text.trim().to_owned();
+             if recipe.prune {
+                 text = unloop(&text);
+             }
+-            keep_segment(start, end, text)
++            on_speech(start, end, text, &speech)
+         });
+         let lines: Vec<Segment> = lines.collect();
+         Ok(if recipe.prune {
+@@ -1570,22 +1641,54 @@ mod tests {
+         }
+     }
+ 
+-    /// The reporter's clip in #438: five lines, each after a silence.
+-    /// Whisper started each where the last had ended; the speech says
+-    /// where it starts.
++    /// Whisper can return one line across speech separated by long silence.
++    /// Each speech span gets its own timed caption; the gap is never covered.
++    #[test]
++    fn one_whisper_line_is_split_at_a_long_silence_between_speech_spans() {
++        let speech = [(1.0, 2.0), (22.0, 23.0)];
++        let captions = on_speech(
++            0.0,
++            24.0,
++            "First phrase after the pause".to_owned(),
++            &speech,
++        );
++
++        assert_eq!(captions.len(), 2);
++        assert_eq!((captions[0].start, captions[0].end), (1.0, 2.0));
++        assert_eq!((captions[1].start, captions[1].end), (22.0, 23.0));
++        assert_eq!(captions[0].text, "First phrase after");
++        assert_eq!(captions[1].text, "the pause");
++        assert!(captions[0].end < captions[1].start);
++        assert_eq!(captions[1].start - captions[0].end, 20.0);
++    }
++
+     #[test]
+-    fn a_caption_starts_and_ends_with_the_speech_it_covers() {
+-        let speech = [(3.07, 4.93), (14.08, 16.48), (25.09, 27.52)];
+-        assert_eq!(on_speech(0.0, 7.0, &speech), (3.07, 4.93));
+-        assert_eq!(on_speech(7.0, 18.0, &speech), (14.08, 16.48));
+-        // A line whisper split in two keeps its split.
+-        assert_eq!(on_speech(25.0, 26.0, &speech), (25.09, 26.0));
+-        assert_eq!(on_speech(26.0, 30.0, &speech), (26.0, 27.52));
+-        // Two spans under one caption: from the first to the last.
+-        assert_eq!(on_speech(0.0, 20.0, &speech), (3.07, 16.48));
+-        // Over no detected speech, or with no detector: whisper's times.
+-        assert_eq!(on_speech(40.0, 45.0, &speech), (40.0, 45.0));
+-        assert_eq!(on_speech(0.0, 7.0, &[]), (0.0, 7.0));
++    fn a_caption_keeps_whisper_timing_when_no_speech_span_matches() {
++        let expected = Segment {
++            start: 40.0,
++            end: 45.0,
++            text: "Still audible".to_owned(),
++        };
++        assert_eq!(
++            on_speech(40.0, 45.0, "Still audible".to_owned(), &[]),
++            vec![expected.clone()]
++        );
++        assert_eq!(
++            on_speech(40.0, 45.0, "Still audible".to_owned(), &[(0.0, 2.0)]),
++            vec![expected]
++        );
++    }
++
++    #[test]
++    fn one_matching_speech_span_clips_whisper_to_the_detected_speech() {
++        let captions = on_speech(
++            0.0,
++            7.0,
++            "Hello there".to_owned(),
++            &[(3.07, 4.93)],
++        );
++        assert_eq!(captions.len(), 1);
++        assert_eq!((captions[0].start, captions[0].end), (3.07, 4.93));
+     }
+ 
+     #[test]
 diff --git a/src/crates/concat/locales/ar.json b/src/crates/concat/locales/ar.json
-index ea89193..477bf69 100644
+index 67a0b47..5b35e5a 100644
 --- a/src/crates/concat/locales/ar.json
 +++ b/src/crates/concat/locales/ar.json
 @@ -34,13 +34,15 @@
@@ -52,7 +269,7 @@ index ea89193..477bf69 100644
    "captions.placement": "الموضع",
    "captions.readingTheSound": "جارٍ قراءة صوت المقطع",
 diff --git a/src/crates/concat/locales/en.json b/src/crates/concat/locales/en.json
-index 2a791f3..c78c725 100644
+index 03f1b0d..e6158b8 100644
 --- a/src/crates/concat/locales/en.json
 +++ b/src/crates/concat/locales/en.json
 @@ -33,6 +33,8 @@
@@ -74,10 +291,10 @@ index 2a791f3..c78c725 100644
    "captions.placement": "Placement",
    "captions.readingTheSound": "Reading the clip's sound",
 diff --git a/src/crates/concat/src/lib.rs b/src/crates/concat/src/lib.rs
-index a5c806b..c0c777e 100644
+index c6d3ffa..3a69398 100644
 --- a/src/crates/concat/src/lib.rs
 +++ b/src/crates/concat/src/lib.rs
-@@ -2516,6 +2516,12 @@ fn start(project: Option<std::path::PathBuf>, smoke: Smoke) -> Result<(), slint:
+@@ -2487,6 +2487,12 @@ fn start(project: Option<std::path::PathBuf>, smoke: Smoke) -> Result<(), slint:
      app.on_captions_size_changed(on_window!(|state, index: i32| {
          state.handle(Msg::Captions(CaptionsMsg::SizeChanged(index)));
      }));
@@ -90,7 +307,7 @@ index a5c806b..c0c777e 100644
      app.on_captions_begin(on_window!(|state| {
          state.handle(Msg::Captions(CaptionsMsg::Begin));
      }));
-@@ -2553,6 +2559,12 @@ fn start(project: Option<std::path::PathBuf>, smoke: Smoke) -> Result<(), slint:
+@@ -2524,6 +2530,12 @@ fn start(project: Option<std::path::PathBuf>, smoke: Smoke) -> Result<(), slint:
      editor.on_captions_size_changed(on_window!(|state, index: i32| {
          state.handle(Msg::Captions(CaptionsMsg::SizeChanged(index)));
      }));
@@ -104,10 +321,10 @@ index a5c806b..c0c777e 100644
          state.handle(Msg::Captions(CaptionsMsg::Begin));
      }));
 diff --git a/src/crates/concat/src/panes/captions.rs b/src/crates/concat/src/panes/captions.rs
-index a078ec2..de68555 100644
+index 71e585d..eefe0d1 100644
 --- a/src/crates/concat/src/panes/captions.rs
 +++ b/src/crates/concat/src/panes/captions.rs
-@@ -64,6 +64,8 @@ pub enum CaptionsMsg {
+@@ -63,6 +63,8 @@ pub enum CaptionsMsg {
      /// Row in the language list: 0 is "Auto-detect", then
      /// [`concat_speech::transcribe::LANGUAGES`] in its order.
      LanguageChanged(i32),
@@ -116,7 +333,7 @@ index a078ec2..de68555 100644
      PlacementChanged(i32),
      SizeChanged(i32),
      /// Run the pass the sheet describes.
-@@ -112,8 +114,9 @@ pub struct CaptionsPane {
+@@ -111,8 +113,9 @@ pub struct CaptionsPane {
      /// "Use Sample Voice": the words come from [`Self::clip`]'s sound
      /// when on, from [`Self::text`] when off.
      pub from_voice: bool,
@@ -128,7 +345,7 @@ index a078ec2..de68555 100644
      /// returns to the same clip. The panel floats over a live editor, so
      /// a clip with sound selected since is the one shown and run instead;
      /// see [`Self::subject_clip`].
-@@ -134,6 +137,9 @@ pub struct CaptionsPane {
+@@ -133,6 +136,9 @@ pub struct CaptionsPane {
      pub placement: usize,
      /// 0 small, 1 medium, 2 large.
      pub size: usize,
@@ -138,7 +355,7 @@ index a078ec2..de68555 100644
      pub running: bool,
      /// How far the running transcription looks.
      pub pace: Pace,
-@@ -215,6 +221,15 @@ impl CaptionsPane {
+@@ -214,6 +220,15 @@ impl CaptionsPane {
                  studio.prefs.caption_language = self.language.clone();
                  studio.prefs.save(&studio.host.dirs);
              }
@@ -154,7 +371,7 @@ index a078ec2..de68555 100644
              CaptionsMsg::PlacementChanged(index) => {
                  self.placement = (index.max(0) as usize).min(2);
              }
-@@ -246,6 +261,11 @@ impl CaptionsPane {
+@@ -245,6 +260,11 @@ impl CaptionsPane {
                          };
                          let look = subject.look;
                          let (base, font) = caption_base(studio);
@@ -166,7 +383,7 @@ index a078ec2..de68555 100644
                          let commands: Vec<Command> = segments
                              .into_iter()
                              .filter_map(|segment| {
-@@ -505,6 +525,23 @@ impl CaptionsPane {
+@@ -504,6 +524,23 @@ impl CaptionsPane {
                  .filter(|code| language_row(Some(code)) > 0),
              placement: 0,
              size: 1,
@@ -190,7 +407,7 @@ index a078ec2..de68555 100644
              timings: std::mem::take(&mut self.timings),
              shown: self.shown,
              ..CaptionsPane::default()
-@@ -534,6 +571,17 @@ impl CaptionsPane {
+@@ -533,6 +570,17 @@ impl CaptionsPane {
          )
      }
  
@@ -208,7 +425,7 @@ index a078ec2..de68555 100644
      /// The script as titles, one after another from the playhead.
      fn run_script(&mut self, studio: &mut Studio) {
          let lines = script_captions(&self.text);
-@@ -577,6 +625,27 @@ impl CaptionsPane {
+@@ -576,6 +624,27 @@ impl CaptionsPane {
              self.message = t("captions.clipNoLongerTimeline");
              return;
          };
@@ -236,7 +453,7 @@ index a078ec2..de68555 100644
          let Some(media) = studio.project().media_by_id(&clip.media_id).cloned() else {
              self.message = t("captions.clipHasNoFile");
              return;
-@@ -591,8 +660,8 @@ impl CaptionsPane {
+@@ -590,8 +659,8 @@ impl CaptionsPane {
          let request = concat_speech::transcribe::TranscribeRequest {
              path: media.path.clone(),
              audio_stream: clip.audio_stream,
@@ -247,7 +464,7 @@ index a078ec2..de68555 100644
              model_id: model.clone(),
              language: (!concat_speech::transcribe::english_only(&model))
                  .then(|| self.language.clone())
-@@ -621,8 +690,8 @@ impl CaptionsPane {
+@@ -620,8 +689,8 @@ impl CaptionsPane {
              (Stage::Working, windows * per_window),
          ]);
          self.subject = Some(Subject {
@@ -258,7 +475,7 @@ index a078ec2..de68555 100644
              look: self.look(),
              model,
              windows,
-@@ -700,6 +769,8 @@ impl CaptionsPane {
+@@ -699,6 +768,8 @@ impl CaptionsPane {
              language_fixed: english_only,
              placement: self.placement as i32,
              size: self.size as i32,
@@ -267,7 +484,7 @@ index a078ec2..de68555 100644
              running: self.running,
              progress: self.pace.floor,
              ceiling: self.pace.ceiling,
-@@ -717,6 +788,166 @@ impl CaptionsPane {
+@@ -716,6 +787,166 @@ impl CaptionsPane {
      }
  }
  
@@ -434,7 +651,7 @@ index a078ec2..de68555 100644
  /// English, as the language list names it.
  const ENGLISH: &str = "English";
  
-@@ -1059,7 +1290,12 @@ fn wrap_caption(sentence: &str) -> Vec<String> {
+@@ -1058,7 +1289,12 @@ fn wrap_caption(sentence: &str) -> Vec<String> {
  
  #[cfg(test)]
  mod tests {
@@ -448,7 +665,7 @@ index a078ec2..de68555 100644
  
      #[test]
      fn imported_srt_preserves_short_cues_and_multiline_text() {
-@@ -1188,4 +1424,187 @@ mod tests {
+@@ -1187,4 +1423,187 @@ mod tests {
          assert!(script_captions("  \n ").is_empty());
          assert_eq!(script_captions("你好。再见！").len(), 2);
      }
@@ -637,7 +854,7 @@ index a078ec2..de68555 100644
 +
  }
 diff --git a/src/crates/concat/src/prefs.rs b/src/crates/concat/src/prefs.rs
-index fa99cf2..bc0445a 100644
+index c517e8a..fb4ae9e 100644
 --- a/src/crates/concat/src/prefs.rs
 +++ b/src/crates/concat/src/prefs.rs
 @@ -111,6 +111,11 @@ pub struct Preferences {
@@ -652,7 +869,7 @@ index fa99cf2..bc0445a 100644
      /// The text preset captions are set in, by id; `None`, "default" and
      /// an id no longer on the list are the plain look.
      pub caption_style: Option<String>,
-@@ -1262,4 +1267,23 @@ mod tests {
+@@ -1258,4 +1263,23 @@ mod tests {
          assert_eq!(leftovers, 0);
          let _ = std::fs::remove_dir_all(dirs.config.parent().expect("a root"));
      }
@@ -765,10 +982,10 @@ index cd86462..ca04c10 100644
          cancel => { root.cancel(); }
          import-srt => { root.import-srt(); }
 diff --git a/src/crates/concat/ui/editor.slint b/src/crates/concat/ui/editor.slint
-index fa463d7..7d5b9ae 100644
+index bf129a0..a0758f9 100644
 --- a/src/crates/concat/ui/editor.slint
 +++ b/src/crates/concat/ui/editor.slint
-@@ -463,6 +463,8 @@ export global Editor {
+@@ -461,6 +461,8 @@ export global Editor {
      callback captions-language-changed(index: int);
      callback captions-placement-changed(index: int);
      callback captions-size-changed(index: int);
@@ -796,10 +1013,10 @@ index 120f061..d3176af 100644
                      @children
                  }
 diff --git a/src/crates/concat/ui/workspace/media-pane.slint b/src/crates/concat/ui/workspace/media-pane.slint
-index 08ec201..908f114 100644
+index a0fed20..b012d1a 100644
 --- a/src/crates/concat/ui/workspace/media-pane.slint
 +++ b/src/crates/concat/ui/workspace/media-pane.slint
-@@ -1767,6 +1767,8 @@ export component MediaPane inherits Rectangle {
+@@ -1765,6 +1765,8 @@ export component MediaPane inherits Rectangle {
      callback captions-language-changed(index: int);
      callback captions-placement-changed(index: int);
      callback captions-size-changed(index: int);
@@ -808,7 +1025,7 @@ index 08ec201..908f114 100644
      callback captions-begin();
      callback captions-cancel();
      callback captions-import-srt();
-@@ -2667,6 +2669,8 @@ export component MediaPane inherits Rectangle {
+@@ -2665,6 +2667,8 @@ export component MediaPane inherits Rectangle {
                          language-changed(index) => { root.captions-language-changed(index); }
                          placement-changed(index) => { root.captions-placement-changed(index); }
                          size-changed(index) => { root.captions-size-changed(index); }
@@ -818,7 +1035,7 @@ index 08ec201..908f114 100644
                          cancel => { root.captions-cancel(); }
                          import-srt => { root.captions-import-srt(); }
 diff --git a/src/crates/concat/ui/workspace/seat.slint b/src/crates/concat/ui/workspace/seat.slint
-index f9b00ef..c6733ac 100644
+index 0c6739c..2eedc35 100644
 --- a/src/crates/concat/ui/workspace/seat.slint
 +++ b/src/crates/concat/ui/workspace/seat.slint
 @@ -116,6 +116,8 @@ export component Seat inherits Rectangle {
