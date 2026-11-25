@@ -1,99 +1,3 @@
-name: Build patched Concat Windows Setup
-
-on:
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-jobs:
-  windows-x64:
-    name: Windows x86_64 installer
-    runs-on: windows-2022
-    timeout-minutes: 180
-    env:
-      CARGO_TERM_COLOR: always
-      ORT_VERSION: "1.28.0"
-      GGML_BACKEND_DL: "ON"
-      GGML_CPU_ALL_VARIANTS: "ON"
-      GGML_AVX2: "OFF"
-      GGML_FMA: "OFF"
-      GGML_F16C: "OFF"
-      GGML_BMI2: "OFF"
-
-    steps:
-      # First check out your fork so the workflow can read the patch stored there.
-      - name: Check out the fork
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      # Do not build the moving main branch. The patch was written for v0.2.12.
-      # Keep the patch file in RUNNER_TEMP while switching the worktree to the
-      # immutable upstream release tag, then restore the patch into that tree.
-      - name: Pin source to upstream v0.2.12
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $patch = Join-Path $PWD "Concat-0.2.12-fixes.patch"
-          if (-not (Test-Path $patch)) {
-            throw "Concat-0.2.12-fixes.patch is missing from the fork's repository root."
-          }
-
-          $savedPatch = Join-Path $env:RUNNER_TEMP "Concat-0.2.12-fixes.patch"
-          Copy-Item $patch $savedPatch -Force
-
-          git fetch --depth=1 https://github.com/jub0t/concat.git refs/tags/v0.2.12:refs/tags/v0.2.12
-          if ($LASTEXITCODE -ne 0) { throw "Could not fetch the upstream v0.2.12 tag." }
-
-          git checkout --detach refs/tags/v0.2.12
-          if ($LASTEXITCODE -ne 0) { throw "Could not switch to upstream tag v0.2.12." }
-
-          Copy-Item $savedPatch $patch -Force
-          $sourceCommit = git rev-parse HEAD
-          if ($LASTEXITCODE -ne 0) { throw "Could not identify the pinned source commit." }
-          Write-Host "Using upstream Concat v0.2.12 at commit $sourceCommit."
-
-      - name: Read and verify the source version
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $cargo = Get-Content "src/Cargo.toml" -Raw
-          $match = [regex]::Match($cargo, '(?m)^version\s*=\s*"([^\"]+)"')
-          if (-not $match.Success) { throw "Could not read the application version from src/Cargo.toml" }
-          $version = $match.Groups[1].Value
-          if ($version -ne "0.2.12") { throw "Expected pinned source version 0.2.12, found $version. Stop rather than build the wrong version." }
-          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Write-Host "Building patched Concat $version for Windows x86_64."
-
-      - name: Apply and validate the Auto Captions fixes
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $patch = "Concat-0.2.12-fixes.patch"
-          if (-not (Test-Path $patch)) { throw "$patch is missing from the repository root." }
-
-          # The published patch has one added documentation line missing its
-          # leading '+' in some copies. Correct that exact line in a temporary
-          # copy; do not silently alter the patch stored in the fork.
-          $patchText = [System.IO.File]::ReadAllText((Resolve-Path $patch))
-          $badLine = 'If VAD has no matching region or its result is not trusted, the previous Whisper timing fallback is retained.'
-          $goodLine = '+' + $badLine
-          if ($patchText.Contains($badLine) -and -not $patchText.Contains($goodLine)) {
-            $patchText = [regex]::Replace(
-              $patchText,
-              '(?m)^' + [regex]::Escape($badLine) + '\r?$',
-              $goodLine
-            )
-          }
-
-          $fixedPatch = Join-Path $env:RUNNER_TEMP "Concat-0.2.12-fixes.fixed.patch"
-          [System.IO.File]::WriteAllText($fixedPatch, $patchText, [System.Text.UTF8Encoding]::new($false))
-
-          git apply --check $fixedPatch
-          if ($LASTEXITCODE -ne 0) { throw "The patch does not match upstream v0.2.12. No source files were changed." }
-          git apply $fixedPatch
-          if ($LASTEXITCODE -ne 0) { throw "Applying the Auto Captions patch failed." }
-          git diff --check
-          if ($LASTEXITCODE -ne 0) { throw "The patched source has whitespace errors." }
           Write-Host "Patch validation and application succeeded."
 
       - name: Install the pinned Rust toolchain
@@ -178,8 +82,24 @@ jobs:
           $built = Get-ChildItem "src\target\x86_64-pc-windows-msvc\app\build\whisper-rs-sys-*\out\bin\ggml-cpu-x64.dll" |
             Sort-Object LastWriteTime -Descending | Select-Object -First 1
           if (-not $built) { throw "whisper-rs-sys did not produce ggml-cpu-x64.dll." }
-          Copy-Item (Join-Path $built.DirectoryName "whisper.dll") $dir
-          Copy-Item (Join-Path $built.DirectoryName "ggml\*.dll") $dir
+          Write-Host "Whisper/GGML build output: $($built.DirectoryName)"
+          $whisperDll = Join-Path $built.DirectoryName "whisper.dll"
+          if (-not (Test-Path $whisperDll)) {
+            throw "whisper.dll is missing from $($built.DirectoryName)."
+          }
+          Copy-Item $whisperDll $dir
+
+          # whisper-rs-sys puts whisper.dll and all ggml*.dll files together
+          # in out\bin. They are not inside an additional 'ggml' directory.
+          $ggmlDlls = @(Get-ChildItem -LiteralPath $built.DirectoryName -Filter "ggml*.dll" -File)
+          if ($ggmlDlls.Count -eq 0) {
+            throw "No ggml*.dll files were found in $($built.DirectoryName)."
+          }
+          $ggmlDlls | ForEach-Object {
+            Write-Host "Staging $($_.Name)"
+            Copy-Item -LiteralPath $_.FullName -Destination $dir -Force
+          }
+
           foreach ($module in "x64", "sandybridge", "haswell") {
             if (-not (Test-Path (Join-Path $dir "ggml-cpu-$module.dll"))) {
               throw "The required ggml-cpu-$module.dll module is missing."
@@ -238,13 +158,3 @@ jobs:
             "/DStage=$PWD\stage\$name" "/DOut=$PWD\stage" assets\windows\concat.iss
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE." }
           $installer = "stage\$name-setup.exe"
-          if (-not (Test-Path $installer)) { throw "The expected Setup.exe was not created." }
-          Write-Host "Created $installer"
-
-      - name: Upload the Windows installer
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: Concat-0.2.12-Windows-Setup-Fixed
-          path: stage/Concat-0.2.12-windows-x86_64-setup.exe
-          if-no-files-found: error
-          retention-days: 30
