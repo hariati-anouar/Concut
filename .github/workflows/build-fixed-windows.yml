@@ -14,6 +14,8 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       ORT_VERSION: "1.28.0"
+      # Match upstream v0.2.12: never tune the common GGML code for the runner CPU.
+      GGML_NATIVE: "OFF"
       GGML_BACKEND_DL: "ON"
       GGML_CPU_ALL_VARIANTS: "ON"
       GGML_AVX2: "OFF"
@@ -156,8 +158,29 @@ jobs:
           $ErrorActionPreference = "Stop"
           Push-Location src
           try {
+            # GGML_NATIVE changes CMake's CPU code generation. Remove only the
+            # cached whisper-rs-sys CMake build so it is configured again with
+            # GGML_NATIVE=OFF rather than reusing a previous runner-specific build.
+            $whisperBuildRoot = "target\x86_64-pc-windows-msvc\app\build"
+            if (Test-Path -LiteralPath $whisperBuildRoot) {
+              Get-ChildItem -LiteralPath $whisperBuildRoot -Directory -Filter "whisper-rs-sys-*" |
+                ForEach-Object {
+                  Write-Host "Removing cached Whisper/GGML build: $($_.FullName)"
+                  Remove-Item -LiteralPath $_.FullName -Recurse -Force
+                }
+            }
+
             cargo build --profile app -p concat --target x86_64-pc-windows-msvc
             if ($LASTEXITCODE -ne 0) { throw "Cargo build failed with exit code $LASTEXITCODE." }
+
+            # Print the actual CMake options recorded by whisper-rs-sys.
+            $cmakeCaches = Get-ChildItem "target\x86_64-pc-windows-msvc\app\build\whisper-rs-sys-*" `
+              -Filter "CMakeCache.txt" -File -Recurse -ErrorAction SilentlyContinue
+            foreach ($cache in $cmakeCaches) {
+              Write-Host "GGML configuration in $($cache.FullName):"
+              Select-String -Path $cache.FullName -Pattern '^GGML_(NATIVE|BACKEND_DL|CPU_ALL_VARIANTS|AVX2|FMA|F16C|BMI2):' |
+                ForEach-Object { Write-Host "  $($_.Line)" }
+            }
           }
           finally { Pop-Location }
 
