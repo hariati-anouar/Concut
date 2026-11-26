@@ -205,12 +205,54 @@ jobs:
 
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           if (-not (Test-Path $vswhere)) { throw "Visual Studio's vswhere.exe was not found." }
-          $vs = & $vswhere -latest -products * -property installationPath
-          $crt = Get-ChildItem "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC14\*.CRT" -Directory |
-            Sort-Object FullName -Descending | Select-Object -First 1
-          if (-not $crt) { throw "The Visual C++ runtime redistributable folder was not found." }
-          $dumpbin = & $vswhere -latest -products * -find "VC\Tools\MSVC\*\*\bin\Host\*\*\dumpbin.exe" | Select-Object -First 1
-          if (-not $dumpbin) { throw "dumpbin.exe was not found in Visual Studio Build Tools." }
+          $vsResult = & $vswhere -latest -products * -property installationPath
+          if ($LASTEXITCODE -ne 0) { throw "vswhere failed while locating Visual Studio." }
+          $vs = [string]($vsResult | Select-Object -First 1)
+          $vs = $vs.Trim()
+          if (-not $vs -or -not (Test-Path -LiteralPath $vs)) { throw "vswhere could not locate the Visual Studio installation." }
+          Write-Host "Visual Studio installation: $vs"
+
+          # VS 2022 stores the x64 runtime here:
+          # VC\Redist\MSVC\<version>\x64\Microsoft.VC143.CRT
+          # Do not look for a Microsoft.VC14\*.CRT nested path: that folder
+          # name does not exist in the current VS 2022 layout.
+          $redistRoot = Join-Path $vs "VC\Redist\MSVC"
+          if (-not (Test-Path -LiteralPath $redistRoot)) {
+            throw "The Visual C++ redist root was not found: $redistRoot"
+          }
+          $crtCandidates = @(
+            Get-ChildItem -LiteralPath $redistRoot -Directory -Recurse -ErrorAction Stop |
+              Where-Object {
+                $_.Name -match '^Microsoft\.VC\d+\.CRT$' -and
+                $_.FullName -match '\\x64\\Microsoft\.VC\d+\.CRT$'
+              }
+          )
+          if ($crtCandidates.Count -eq 0) {
+            $found = Get-ChildItem -LiteralPath $redistRoot -Directory -Recurse -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match '^Microsoft\.VC.*\.CRT$' } |
+              Select-Object -ExpandProperty FullName
+            Write-Host "CRT directories found under redist root:"
+            $found | ForEach-Object { Write-Host "  $_" }
+            throw "The x64 Visual C++ CRT folder (for example Microsoft.VC143.CRT) was not found under $redistRoot."
+          }
+          $crt = $crtCandidates |
+            Sort-Object -Property @{ Expression = {
+              $versionFolder = Split-Path (Split-Path $_.FullName -Parent) -Leaf
+              try { [version]$versionFolder } catch { [version]'0.0' }
+            } } -Descending |
+            Select-Object -First 1
+          Write-Host "Using Visual C++ runtime folder: $($crt.FullName)"
+
+          # Locate the x64-hosted x64 dumpbin from the installed MSVC toolset.
+          $msvcTools = Join-Path $vs "VC\Tools\MSVC"
+          if (-not (Test-Path -LiteralPath $msvcTools)) { throw "MSVC tools folder was not found: $msvcTools" }
+          $dumpbinItem = Get-ChildItem -LiteralPath $msvcTools -Filter "dumpbin.exe" -File -Recurse -ErrorAction Stop |
+            Where-Object { $_.FullName -match '\\bin\\Hostx64\\x64\\dumpbin\.exe$' } |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if (-not $dumpbinItem) { throw "x64 dumpbin.exe was not found under $msvcTools." }
+          $dumpbin = $dumpbinItem.FullName
+          Write-Host "Using dumpbin: $dumpbin"
 
           # Include the Visual C++ runtime DLLs imported by the app and its DLLs.
           foreach ($pass in 1, 2) {
